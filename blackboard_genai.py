@@ -55,7 +55,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 # ==========================================
 class Config:
     # --- カメラ ---
-    SRC = 0                  # カメラ番号（/dev/video0 なら 0）
+    SRC = "/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0"  # Logicool BRIO webcam (fixed name; laptop camera = 0)
     FHD_SIZE = (1920, 1080)  # 監視用の解像度
     UHD_SIZE = (3840, 2160)  # 撮影用の解像度
     FPS = 30
