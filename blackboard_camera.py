@@ -3,6 +3,7 @@ import cv2
 import time
 import threading
 import logging
+import platform
 from enum import Enum, auto
 
 # Qt系の不要なログ出力を抑制
@@ -29,6 +30,12 @@ class Config:
     STABLE_TIME = 2.0              # 静止確認時間（秒）
     COOLDOWN_TIME = 5.0            # 撮影後のクールダウン時間（秒）
 
+    # --- 撮影の速度・安定性 ---
+    CAPTURE_TIMEOUT = 5.0          # 4K画像が届くまで待つ最大時間（秒）
+    CAPTURE_SKIP_FRAMES = 2        # 切り替え直後に捨てるフレーム数（露出が安定するまで）
+    OPEN_RETRIES = 5               # カメラを開き直すときの最大試行回数
+    JPEG_QUALITY = 95              # 保存するJPEGの画質（0〜100）
+
 # ==========================================
 # 状態定義（ステートマシン）
 # ==========================================
@@ -39,57 +46,111 @@ class AppState(Enum):
     CAPTURING = auto()     # 4K撮影中
     COOLDOWN = auto()      # クールダウン
 
+def _camera_backend():
+    """OSに合わせてOpenCVのカメラバックエンドを選ぶ（LinuxはV4L2、WindowsはDirectShow）"""
+    system = platform.system()
+    if system == "Linux":
+        return cv2.CAP_V4L2
+    if system == "Windows":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
+
+
 # ==========================================
 # 安全な動的解像度変更カメラ
 # ==========================================
 class SafeDynamicCamera:
+    """別スレッドで常に最新フレームを読み込み、撮影時だけ高解像度に切り替えるカメラ。
+
+    撮影（解像度の切り替え → 4K画像の取得 → 監視解像度への復帰）はすべてカメラ用スレッドで行い、
+    メインスレッド（画面表示・キー入力）を止めないようにしている。
+    """
+
     def __init__(self, src=0, width=1920, height=1080, request_fps=30):
         self.src = src
-        self.target_size = (width, height)
+        self.monitor_size = (width, height)
         self.request_fps = request_fps
-        
+
         self.stopped = False
-        self.switch_requested = False
-        
+
         self.lock = threading.Lock()
         self.new_frame_event = threading.Event()
-        
+
         self.ret = False
         self.frame = None
+
+        # 撮影要求（request_capture で設定し、カメラ用スレッドが処理する）
+        self.capture_event = threading.Event()
+        self.capture_size = None
+        self.capture_callback = None
+        self.busy = False
 
     def start(self):
         threading.Thread(target=self._thread_loop, daemon=True).start()
         return self
 
-    def _init_camera(self):
-        cap = cv2.VideoCapture(self.src, cv2.CAP_V4L2)
+    def _open(self, size):
+        """指定した解像度でカメラを開く。開けないときは少し待って再試行する"""
+        cap = None
+        for _ in range(Config.OPEN_RETRIES):
+            cap = cv2.VideoCapture(self.src, _camera_backend())
+            if cap.isOpened():
+                break
+            cap.release()
+            time.sleep(0.2)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.target_size[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_size[1])
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
         cap.set(cv2.CAP_PROP_FPS, self.request_fps)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
+    def _grab_photo(self, cap):
+        """切り替え直後の不安定なフレームを捨ててから1枚取得する（最大 CAPTURE_TIMEOUT 秒待つ）"""
+        deadline = time.time() + Config.CAPTURE_TIMEOUT
+        frame = None
+        good = 0
+        while time.time() < deadline and not self.stopped:
+            ret, f = cap.read()
+            if ret and f is not None:
+                frame = f
+                good += 1
+                if good > Config.CAPTURE_SKIP_FRAMES:
+                    break
+        return frame
+
+    def _do_capture(self, cap):
+        """監視用 → 撮影用 → 監視用 と切り替えて1枚撮る。新しい監視用の cap を返す"""
+        t0 = time.time()
+        cap.release()
+        cap = self._open(self.capture_size)
+        t1 = time.time()
+        frame = self._grab_photo(cap)
+        t2 = time.time()
+        cap.release()
+        cap = self._open(self.monitor_size)
+        t3 = time.time()
+        logging.info(f"撮影時間: 切替 {t1 - t0:.1f}秒 / 取得 {t2 - t1:.1f}秒 / 復帰 {t3 - t2:.1f}秒")
+
+        callback = self.capture_callback
+        self.busy = False
+        if callback:
+            callback(frame)
+        return cap
+
     def _thread_loop(self):
-        cap = self._init_camera()
-        
+        cap = self._open(self.monitor_size)
+
         while not self.stopped:
-            if self.switch_requested:
-                cap.release()
-                time.sleep(0.3)
-                cap = self._init_camera()
-                
-                for _ in range(3):
-                    cap.read()
-                    time.sleep(0.05)
-                    
-                self.switch_requested = False
+            if self.capture_event.is_set():
+                self.capture_event.clear()
+                cap = self._do_capture(cap)
                 continue
 
             if not cap.isOpened():
                 time.sleep(0.01)
                 continue
-                
+
             ret, frame = cap.read()
             if ret and frame is not None:
                 with self.lock:
@@ -98,24 +159,28 @@ class SafeDynamicCamera:
                 self.new_frame_event.set()
             else:
                 time.sleep(0.005)
-                
+
         cap.release()
 
-    def read(self):
-        if not self.new_frame_event.wait(timeout=1.0):
+    def read(self, timeout=0.1):
+        """新しいフレームが届くまで最大 timeout 秒待って返す（撮影中は画面を止めないよう短めに待つ）"""
+        if not self.new_frame_event.wait(timeout=timeout):
             return False, None
-        
+
         self.new_frame_event.clear()
         with self.lock:
             return self.ret, self.frame.copy() if self.frame is not None else None
 
-    def change_resolution_sync(self, width, height):
-        self.target_size = (width, height)
-        self.switch_requested = True
-        
-        while self.switch_requested and not self.stopped:
-            time.sleep(0.05)
-        self.new_frame_event.clear()
+    def request_capture(self, size, callback):
+        """撮影を予約してすぐに戻る。撮影が終わるとカメラ用スレッドから callback(frame) が呼ばれる
+        （失敗時は frame が None）。撮影中なら False を返す"""
+        if self.busy:
+            return False
+        self.busy = True
+        self.capture_size = size
+        self.capture_callback = callback
+        self.capture_event.set()
+        return True
 
     def stop(self):
         self.stopped = True
@@ -143,6 +208,9 @@ class BlackboardApp:
         os.makedirs(self.save_dir, exist_ok=True)
         
         self.cam = SafeDynamicCamera(Config.SRC, *Config.FHD_SIZE, Config.FPS)
+        self.capture_done = threading.Event()   # カメラ用スレッドで撮影が終わったら立つ
+        self.save_threads = []                  # 画像を保存中のスレッド
+        self.last_display = None                # 撮影中に表示し続ける最後の画面
         
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
@@ -164,8 +232,15 @@ class BlackboardApp:
         
         try:
             while True:
+                self._check_capture_done()
+
                 ret, frame = self.cam.read()
                 if not ret or frame is None:
+                    # 撮影で解像度を切り替えている間もウィンドウを固まらせない
+                    if self.last_display is not None:
+                        shown = self.last_display.copy()
+                        self._draw_hud(shown)
+                        cv2.imshow("Blackboard Auto-Capture System", shown)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                     continue
@@ -181,6 +256,12 @@ class BlackboardApp:
                     break
 
         finally:
+            # 撮影中・保存中の画像があれば終わるまで待つ
+            if self.state == AppState.CAPTURING:
+                logging.info("撮影中の画像を待っています...")
+                self.capture_done.wait(timeout=Config.CAPTURE_TIMEOUT + 10)
+            for t in self.save_threads:
+                t.join()
             self.cam.stop()
             cv2.destroyAllWindows()
             logging.info("システムを安全に終了しました。")
@@ -214,6 +295,7 @@ class BlackboardApp:
                                   (pts[0][0], max(30, pts[0][1] - 10)), 0.6, (0, 255, 0), 2)
 
         self._update_state(frame, current_y_ratio)
+        self.last_display = frame.copy()
         self._draw_hud(frame)
         cv2.imshow("Blackboard Auto-Capture System", frame)
 
@@ -271,25 +353,39 @@ class BlackboardApp:
         self.prev_y_ratio = current_y_ratio
 
     def _execute_capture(self, current_frame):
-        logging.info("4K高画質撮影モードへ安全に切り替え中...")
-        
-        self.cam.change_resolution_sync(*Config.UHD_SIZE)
-        
-        ret_4k, frame_4k = self.cam.read()
-        if ret_4k and frame_4k is not None:
+        """撮影を予約するだけですぐ戻る（切り替え・取得はカメラ用スレッド、保存は別スレッドで行う）"""
+        logging.info("4K高画質撮影モードへ切り替え中...")
+        self.capture_done.clear()
+        if not self.cam.request_capture(Config.UHD_SIZE, self._on_photo):
+            logging.warning("前の撮影がまだ終わっていないため、今回はスキップします。")
+            self.capture_done.set()
+
+    def _on_photo(self, frame_4k):
+        """カメラ用スレッドから呼ばれる。保存は別スレッドに任せてカメラをすぐ監視に戻す"""
+        if frame_4k is None:
+            logging.error("4K画像のキャプチャに失敗しました")
+        else:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             filepath = os.path.join(self.save_dir, f"blackboard_4k_{timestamp}.jpg")
-            cv2.imwrite(filepath, frame_4k)
+            t = threading.Thread(target=self._save_photo, args=(filepath, frame_4k))
+            t.start()
+            self.save_threads.append(t)
+        self.capture_done.set()
+
+    @staticmethod
+    def _save_photo(filepath, frame):
+        if cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, Config.JPEG_QUALITY]):
             logging.info(f"保存成功: {filepath}")
         else:
-            logging.error("4K画像のキャプチャに失敗しました")
-            
-        logging.info("監視モード(FHD)へ復帰中...")
-        self.cam.change_resolution_sync(*Config.FHD_SIZE)
-        
-        self.cooldown_start_time = time.time()
-        self.state = AppState.COOLDOWN
-        self.prev_y_ratio = None
+            logging.error(f"画像の保存に失敗しました: {filepath}")
+
+    def _check_capture_done(self):
+        """撮影が終わっていたらクールダウンへ進む（マーカーが見えていなくても進める）"""
+        if self.state == AppState.CAPTURING and self.capture_done.is_set():
+            logging.info("監視モード(FHD)に復帰しました。")
+            self.cooldown_start_time = time.time()
+            self.state = AppState.COOLDOWN
+            self.prev_y_ratio = None
 
     def _draw_hud(self, frame):
         state_info = {

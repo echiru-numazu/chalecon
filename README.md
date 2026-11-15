@@ -34,6 +34,15 @@ pip install opencv-contrib-python fpdf2 google-genai pillow
 sudo apt install fonts-noto-cjk fonts-dejavu-core
 ```
 
+インストール済みか確認するには（2行とも `ii` で始まればOK）:
+
+```bash
+dpkg -l fonts-noto-cjk fonts-dejavu-core | grep ^ii
+fc-list :lang=ja file | head -3      # 日本語フォントのファイルが表示されればOK
+```
+
+フォントが見つからないと、実行時に `日本語フォントが見つかりません` と表示され、PDFの日本語が「?」になります。
+
 特定のフォントを使いたい場合は `PDF_FONT_PATH=/path/to/font.ttf` を設定してください。
 
 ### Gemini APIキー
@@ -170,6 +179,14 @@ python -c "import cv2; m=cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDi
 | `STABLE_TIME` | `2.0` | 静止していなければならない秒数 |
 | `COOLDOWN_TIME` | `5.0` | 撮影後の待ち時間（秒） |
 | `TARGET_ARUCO_ID` | `0` | 追跡するマーカーのID |
+| `CAPTURE_TIMEOUT` | `5.0` | 4K画像が届くまで待つ最大秒数 |
+| `CAPTURE_SKIP_FRAMES` | `2` | 4Kに切り替えた直後に捨てるフレーム数（露出の安定待ち） |
+| `OPEN_RETRIES` | `5` | カメラを開き直すときの最大試行回数 |
+| `JPEG_QUALITY` | `95` | 保存するJPEGの画質（0〜100） |
+
+### 撮影中の動き
+
+撮影（4Kへの切り替え → 1枚取得 → 監視用解像度に戻す）はカメラ用の別スレッドで、画像の保存もさらに別のスレッドで行います。そのため撮影中もウィンドウは固まらず、`CAPTURING 4K PHOTO...` が表示されたまま操作できます。撮影にかかった時間は毎回ターミナルに `撮影時間: 切替 0.3秒 / 取得 0.6秒 / 復帰 0.3秒` のように表示されるので、遅いときはどの段階かを確認できます。撮影中に `q` を押しても、撮影と保存が終わってから終了します。
 
 ---
 
@@ -202,7 +219,7 @@ python -c "import cv2,glob,os; f=max(glob.glob(os.path.expanduser('~/blackboard_
 
 ### `select() timeout` と「4K画像のキャプチャに失敗しました」の対処
 
-どちらも、カメラは開いているのに画像が送られてこないという意味で、よく同時に出ます。撮影時、プログラムはカメラを閉じて 3840x2160 で開き直し、画像を **1秒** しか待ちません（`blackboard_genai.py` の `_execute_capture`）。時間内に届かないと `4K画像のキャプチャに失敗しました` と表示されます。
+どちらも、カメラは開いているのに画像が送られてこないという意味で、よく同時に出ます。撮影時、プログラムはカメラを閉じて 3840x2160 で開き直し、画像を最大 `CAPTURE_TIMEOUT` 秒（初期値5秒）待ちます（`SafeDynamicCamera._grab_photo`）。時間内に届かないと `4K画像のキャプチャに失敗しました` と表示されます。
 
 次の順番で試してください。
 
@@ -239,7 +256,7 @@ v4l2-ctl -d $DEV --set-fmt-video=width=3840,height=2160,pixelformat=MJPG --strea
 | 結果 | 意味 |
 |---|---|
 | 一覧に `3840x2160` がない | このカメラは4K非対応、または `SRC` が別のカメラを指している |
-| 映像が流れる（`<<<<` とfpsの数値が表示される） | カメラは正常。4Kの起動に1秒以上かかるだけなので、コード側で待ち時間を延ばす必要がある（未対応）。 |
+| 映像が流れる（`<<<<` とfpsの数値が表示される） | カメラは正常。4Kの起動に時間がかかっているので、`Config` の `CAPTURE_TIMEOUT` を増やす。 |
 | 止まる・タイムアウトする | USB、電源、ドライバの問題。手順5へ。 |
 
 **5. ドライバの帯域対策を有効にする。** ノートPCや Raspberry Pi でよく効きます。
@@ -348,7 +365,7 @@ export GEMINI_API_KEY="..."
 | USB | 4Kには **青い USB 3 ポート** を使う |
 | 電源 | 公式の電源アダプタを使う。ウェブカメラは Pi から給電されます。 |
 | 画面 | カメラのウィンドウが表示されるので、モニターか VNC でデスクトップ版OSを使う（SSHのみでは不可） |
-| 速度 | 撮影のたびに4Kへ切り替えるので、数秒かかることがあります |
+| 速度 | 撮影のたびに4Kへ切り替えるので数秒かかることがありますが、その間も画面は固まりません |
 | Piカメラモジュール | リボンケーブル式のカメラは `picamera2` が必要で、このコードのままでは動きません |
 
 コードは `git clone` か `scp` で移します。キーはコードに含まれていないので、Pi でも `GEMINI_API_KEY` を設定してください（上の「Gemini APIキー」参照）。
