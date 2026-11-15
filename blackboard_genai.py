@@ -12,7 +12,8 @@ blackboard_camera と genai.py を1つにまとめたプログラムです。
      Markdownの装飾（#見出し・**太字**・箇条書き）も整えてPDFに出力する
 
 【必要なライブラリ】
-  pip install opencv-contrib-python fpdf2 google-generativeai pillow
+  pip install opencv-contrib-python fpdf2 google-genai pillow
+  ※ Gemini は新しい公式SDK google-genai を使用します（旧 google-generativeai は不要）
   ※ ArUco検出には opencv-contrib-python が必要です
   ※ PDF出力は fpdf2 を使用します（旧 PyFPDF ではなく fpdf2 をインストールしてください）
 
@@ -40,7 +41,7 @@ from datetime import datetime
 from enum import Enum, auto
 
 import PIL.Image
-import google.generativeai as genai
+from google import genai
 from fpdf import FPDF
 
 # Qt系の不要なログ出力を抑制
@@ -705,17 +706,21 @@ def summarize_with_gemini(image_paths):
         logging.error("環境変数 GEMINI_API_KEY が設定されていません。APIキーを設定してから再実行してください。")
         return None
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(Config.GEMINI_MODEL)
-
     # プロンプト（テキスト）と全画像を1つのリストにまとめて、1回の呼び出しで送る
-    prompt_parts = [Config.SUMMARY_PROMPT]
+    contents = [Config.SUMMARY_PROMPT]
     for img_path in image_paths:
-        prompt_parts.append(PIL.Image.open(img_path))
+        contents.append(PIL.Image.open(img_path))
 
     logging.info(f"{len(image_paths)} 枚の画像をGeminiに送信して要約中...")
     try:
-        response = model.generate_content(prompt_parts)
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=Config.GEMINI_MODEL,
+            contents=contents,
+        )
+        if not response.text:
+            logging.error("AI処理エラー: Geminiから空の応答が返されました。")
+            return None
         return response.text
     except Exception as e:
         logging.error(f"AI処理エラー: {e}")

@@ -6,7 +6,6 @@
 |---|---|
 | `blackboard_genai.py` | **Main program.** Watches the board with a USB webcam, takes a 4K photo automatically when the board slides and stops. Press `q` to send all photos to Gemini and make a PDF summary. |
 | `blackboard_camera.py` | Camera-only version: takes the photos, no summary. Good for testing. |
-| `genai.py` | Older version that pulls photos from a phone IP-camera app. |
 | `marker_id0.png` | The ArUco marker to stick on the board. |
 
 ---
@@ -20,7 +19,7 @@ sudo apt install python3-venv          # on Ubuntu with Python 3.14: python3.14-
 python3 -m venv myenv
 source myenv/bin/activate
 pip install --upgrade pip
-pip install opencv-contrib-python fpdf2 google-generativeai pillow requests
+pip install opencv-contrib-python fpdf2 google-genai pillow
 ```
 
 - Use **`opencv-contrib-python`**, not `opencv-python`. ArUco marker detection is only in the contrib build.
@@ -45,9 +44,26 @@ To use a specific font instead, set `PDF_FONT_PATH=/path/to/font.ttf`.
 ```bash
 export GEMINI_API_KEY="paste-your-key-here"                         # this terminal only
 echo 'export GEMINI_API_KEY="paste-your-key-here"' >> ~/.bashrc     # permanent
+source ~/.bashrc                                                    # load it now
 ```
 
-Check it with `echo $GEMINI_API_KEY`.
+Check it with `echo $GEMINI_API_KEY`. It should print your key, not a blank line.
+
+**You don't edit any code for the key.** `summarize_with_gemini()` in `blackboard_genai.py` reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) from the environment and passes it to `genai.Client(api_key=...)`. Set the key in the same terminal (or in `~/.bashrc`) that you run the program from.
+
+To change or remove the key later, edit the `export GEMINI_API_KEY=...` line in `~/.bashrc`, then open a new terminal.
+
+If a key was ever written in code and committed or pushed to git, treat it as leaked. Delete it in AI Studio and create a new one. Deleting the file doesn't remove the key from git history.
+
+### Gemini model
+
+Set `GEMINI_MODEL` in `Config` in `blackboard_genai.py`:
+
+```python
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+```
+
+Use a model name listed in AI Studio. A `404 … model not found` error means the name is wrong or the model was retired.
 
 ---
 
@@ -172,8 +188,76 @@ python -c "import cv2,glob,os; f=max(glob.glob(os.path.expanduser('~/blackboard_
 | Stays on `WAITING` while moving | Marker not detected: use more light, a bigger marker, keep the white border, check it's ID 0 from 4x4_50 |
 | Log: movement too small (`移動量が小さいため無視しました`) | Moved less than 7%. Move it farther. |
 | Countdown keeps resetting (`カウントダウンをリセットします`) | Hand shaking. Rest the paper against something. |
-| Log: 4K capture failed (`4K画像のキャプチャに失敗しました`) | Webcam on USB 2. Use a USB 3 port. |
+| Log: 4K capture failed (`4K画像のキャプチャに失敗しました`) | Camera didn't send a 4K frame in time. See below. |
+| `select() timeout` in the terminal | Camera opened but sends no frames. See below. |
 | Camera doesn't open | Webcam not plugged in. Check `ls /dev/v4l/by-id/`. |
+
+### Fixing `select() timeout` and "4K capture failed"
+
+Both errors mean the camera is open but isn't sending pictures. They often show up together. When taking a photo, the program closes the camera, reopens it at 3840x2160, and waits only **1 second** for a frame (`_execute_capture` in `blackboard_genai.py`). If no frame arrives in time, it logs `4K画像のキャプチャに失敗しました`.
+
+Try these in order:
+
+**1. Close anything else using the camera.** That includes a browser tab, Zoom, Cheese, or an earlier run of the script (Ctrl+Z pauses a program without closing it).
+
+```bash
+sudo fuser -v /dev/video*       # which processes have the camera open
+pkill -f blackboard_            # kill leftover runs of the scripts
+```
+
+**2. Check the USB speed.** This is the most common cause.
+
+```bash
+lsusb -t
+```
+
+Find the line with `Driver=uvcvideo`. **480M** means USB 2, which can't carry 4K. Move the camera to a blue USB 3 port, not through a hub, until it shows **5000M**.
+
+**3. Unplug and replug the camera, or reload the driver.**
+
+```bash
+sudo modprobe -r uvcvideo && sudo modprobe uvcvideo
+```
+
+**4. Test the camera without Python.**
+
+```bash
+DEV=/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0
+v4l2-ctl -d $DEV --list-formats-ext | grep -A2 MJPG    # should list 1920x1080 and 3840x2160
+v4l2-ctl -d $DEV --set-fmt-video=width=1920,height=1080,pixelformat=MJPG --stream-mmap --stream-count=60
+v4l2-ctl -d $DEV --set-fmt-video=width=3840,height=2160,pixelformat=MJPG --stream-mmap --stream-count=30
+```
+
+| Result | Meaning |
+|---|---|
+| No `3840x2160` in the list | This camera can't do 4K, or `SRC` points to the wrong camera |
+| Streams (prints `<<<<` and an fps number) | Camera is fine. It's just slower than 1 second to start at 4K, so the code needs to wait longer (not done yet). |
+| Hangs or times out | USB, power or driver problem. Go to step 5. |
+
+**5. Turn on the driver's bandwidth fix.** This often helps on laptops and Raspberry Pis.
+
+```bash
+sudo modprobe -r uvcvideo && sudo modprobe uvcvideo quirks=128
+```
+
+If that fixes it, make it permanent:
+
+```bash
+echo "options uvcvideo quirks=128" | sudo tee /etc/modprobe.d/uvcvideo.conf
+```
+
+**6. Check the device name.** `SRC` in `Config` must end in **`video-index0`**. `index1` is metadata and never sends a picture.
+
+**7. On a Raspberry Pi, check the power.** Use the official power supply. If `vcgencmd get_throttled` prints anything other than `0x0`, the Pi is short on power and the webcam can drop out.
+
+**If you can't get USB 3 working,** lower the photo resolution in `Config` in both files:
+
+```python
+UHD_SIZE = (2560, 1440)   # only if this size appears in --list-formats-ext
+UHD_SIZE = (1920, 1080)   # same as the monitoring size, so no switching at all
+```
+
+**When it happens helps narrow it down.** If the error appears only when a photo is taken (the switch to 4K), look at steps 2, 4 and 5. If it appears right at startup, look at steps 1, 3 and 6.
 
 ---
 
@@ -233,7 +317,7 @@ xdg-open "$(ls -d ~/blackboard_images/Class_* | tail -1)/Summary_Report.pdf"
 
 If the AI step fails, the photos are **not lost**. They stay in the class folder.
 
-The `google-generativeai` library has been replaced by Google's newer `google-genai`. If you see deprecation warnings or strange errors, switch the code to the new library.
+The code uses Google's current `google-genai` library (`from google import genai`). Don't install the old `google-generativeai` package; it is no longer maintained.
 
 ---
 
@@ -246,7 +330,7 @@ sudo apt update
 sudo apt install python3-venv fonts-noto-cjk fonts-dejavu-core
 python3 -m venv myenv
 source myenv/bin/activate
-pip install opencv-contrib-python fpdf2 google-generativeai pillow requests
+pip install opencv-contrib-python fpdf2 google-genai pillow
 export GEMINI_API_KEY="..."
 ```
 
