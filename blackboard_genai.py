@@ -96,7 +96,7 @@ class Config:
     # APIキーは環境変数 GEMINI_API_KEY か、このファイル（キーだけを1行で書く）から読む。
     # デスクトップのアイコンや Thonny から起動すると ~/.bashrc が読まれないため、その場合はファイルを使う。
     API_KEY_FILE = os.path.expanduser("~/.config/gemini_api_key")
-    GEMINI_MODEL = "gemini-3.8-flash"
+    GEMINI_MODEL = "gemini-3.5-flash-lite"
     SUMMARY_PROMPT = (
         "これは授業中に撮影した黒板の画像です。内容を要約し、"
         "箇条書きで整理して、試験の復習に使いやすいように構成してください。"
