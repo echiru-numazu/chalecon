@@ -1,133 +1,139 @@
-# Blackboard Auto-Capture + Gemini Summary — Setup & Usage Guide
+# 黒板自動撮影 ＋ Gemini要約 — セットアップ・使い方ガイド
 
-## Files
+## ファイル構成
 
-| File | What it does |
+| ファイル | 内容 |
 |---|---|
-| `blackboard_genai.py` | **Main program.** Watches the board with a USB webcam, takes a 4K photo automatically when the board slides and stops. Press `q` to send all photos to Gemini and make a PDF summary. |
-| `blackboard_camera.py` | Camera-only version: takes the photos, no summary. Good for testing. |
-| `marker_id0.png` | The ArUco marker to stick on the board. |
+| `blackboard_genai.py` | **メインプログラム。** USBウェブカメラで黒板を監視し、黒板がスライドして止まると自動で4K撮影します。`q` を押すと全画像をGeminiに送り、要約PDFを作成します。 |
+| `blackboard_camera.py` | 撮影のみのバージョン（要約なし）。動作テスト用。 |
+| `marker_id0.png` | 黒板に貼るArUcoマーカー。 |
 
 ---
 
-## 1. Setup
+## 1. セットアップ
 
-### Python environment (one time)
+### Python環境（最初の1回だけ）
 
 ```bash
-sudo apt install python3-venv          # on Ubuntu with Python 3.14: python3.14-venv
+sudo apt install python3-venv          # Ubuntu + Python 3.14 の場合: python3.14-venv
 python3 -m venv myenv
 source myenv/bin/activate
 pip install --upgrade pip
 pip install opencv-contrib-python fpdf2 google-genai pillow
 ```
 
-- Use **`opencv-contrib-python`**, not `opencv-python`. ArUco marker detection is only in the contrib build.
-- Use **`fpdf2`**, not the old `fpdf` package.
-- Run `source myenv/bin/activate` every time you open a new terminal.
+- `opencv-python` ではなく **`opencv-contrib-python`** を使ってください。ArUcoマーカー検出は contrib 版にしか入っていません。
+- 古い `fpdf` ではなく **`fpdf2`** を使ってください。
+- 新しいターミナルを開くたびに `source myenv/bin/activate` を実行してください。
 
-### Fonts for the PDF
+### PDF用フォント
 
-Japanese text and math symbols need Unicode fonts:
+日本語と数学記号を表示するには Unicode フォントが必要です。
 
 ```bash
 sudo apt install fonts-noto-cjk fonts-dejavu-core
 ```
 
-To use a specific font instead, set `PDF_FONT_PATH=/path/to/font.ttf`.
+特定のフォントを使いたい場合は `PDF_FONT_PATH=/path/to/font.ttf` を設定してください。
 
-### Gemini API key
+### Gemini APIキー
 
-1. Go to **aistudio.google.com**, click **Get API key**, then **Create API key**.
-2. Set it as an environment variable. **Never write the key in the code.**
+1. **aistudio.google.com** を開き、**Get API key** → **Create API key** をクリックします。
+2. 環境変数に設定します。**キーをコードに直接書かないでください。**
 
 ```bash
-export GEMINI_API_KEY="paste-your-key-here"                         # this terminal only
-echo 'export GEMINI_API_KEY="paste-your-key-here"' >> ~/.bashrc     # permanent
-source ~/.bashrc                                                    # load it now
+export GEMINI_API_KEY="ここにキーを貼り付け"                         # このターミナルのみ
+echo 'export GEMINI_API_KEY="ここにキーを貼り付け"' >> ~/.bashrc     # 永続化
+source ~/.bashrc                                                     # すぐに読み込む
 ```
 
-Check it with `echo $GEMINI_API_KEY`. It should print your key, not a blank line.
+`echo $GEMINI_API_KEY` で確認できます。空行ではなく、キーが表示されればOKです。
 
-**You don't edit any code for the key.** `summarize_with_gemini()` in `blackboard_genai.py` reads `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) from the environment and passes it to `genai.Client(api_key=...)`. Set the key in the same terminal (or in `~/.bashrc`) that you run the program from.
+**キーのためにコードを編集する必要はありません。** `blackboard_genai.py` の `summarize_with_gemini()` が環境変数 `GEMINI_API_KEY`（または `GOOGLE_API_KEY`）を読み取り、`genai.Client(api_key=...)` に渡します。プログラムを実行するのと同じターミナル（または `~/.bashrc`）でキーを設定してください。
 
-To change or remove the key later, edit the `export GEMINI_API_KEY=...` line in `~/.bashrc`, then open a new terminal.
+あとでキーを変更・削除するときは、`~/.bashrc` の `export GEMINI_API_KEY=...` の行を編集し、ターミナルを開き直してください。
 
-If a key was ever written in code and committed or pushed to git, treat it as leaked. Delete it in AI Studio and create a new one. Deleting the file doesn't remove the key from git history.
+キーを一度でもコードに書いて git に commit・push した場合は、漏えいしたものとして扱ってください。AI Studio でそのキーを削除し、新しいキーを作成します。ファイルを消しても、git の履歴からキーは消えません。
 
-### Gemini model
+### Geminiモデル
 
-Set `GEMINI_MODEL` in `Config` in `blackboard_genai.py`:
+`blackboard_genai.py` の `Config` にある `GEMINI_MODEL` で指定します。
 
 ```python
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_MODEL = "gemini-3.8-flash"
 ```
 
-Use a model name listed in AI Studio. A `404 … model not found` error means the name is wrong or the model was retired.
+AI Studio に載っているモデル名を使ってください。使えるモデルの一覧は次のコマンドでも確認できます（表示される名前の先頭の `models/` は外して指定します）。
+
+```bash
+python -c "from google import genai; [print(m.name) for m in genai.Client().models.list()]"
+```
+
+`404 … model not found` エラーは、モデル名が間違っているか、そのモデルが提供終了になったことを意味します。
 
 ---
 
-## 2. Camera
+## 2. カメラ
 
-### Checking your cameras
+### カメラの確認
 
 ```bash
-# List cameras by name
+# カメラを名前付きで一覧表示
 for d in /sys/class/video4linux/video*; do echo "$(basename $d): $(cat $d/name)"; done
 
-# Fixed device names (don't change after reboot or replug)
+# 固定のデバイス名（再起動や抜き差しでも変わらない）
 ls -l /dev/v4l/by-id/
 
-# Optional: details and supported resolutions
+# 任意: 詳細と対応解像度
 sudo apt install v4l-utils
 v4l2-ctl --list-devices
-v4l2-ctl -d /dev/video4 --list-formats-ext    # look for 3840x2160
+v4l2-ctl -d /dev/video4 --list-formats-ext    # 3840x2160 があるか確認
 ```
 
-### Choosing the camera
+### カメラの指定
 
-Set `SRC` in `Config` in both `blackboard_genai.py` and `blackboard_camera.py`:
+`blackboard_genai.py` と `blackboard_camera.py` の両方の `Config` で `SRC` を設定します。
 
 ```python
-SRC = "/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0"   # Logicool BRIO webcam
-SRC = 0                                                               # laptop camera
+SRC = "/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0"   # Logicool BRIO ウェブカメラ
+SRC = 0                                                               # ノートPC内蔵カメラ
 ```
 
-Use the `/dev/v4l/by-id/...` name instead of a number. Numbers like `/dev/video4` are handed out in detection order and can change after a reboot or replug. The by-id name is built from the camera's serial number, so it stays the same.
+番号ではなく `/dev/v4l/by-id/...` の名前を使ってください。`/dev/video4` のような番号は検出順に割り当てられるため、再起動や抜き差しで変わることがあります。by-id の名前はカメラのシリアル番号から作られるので変わりません。
 
-### What `index` means
+### `index` の意味
 
-One USB camera usually creates several `/dev/video` devices. `index` numbers them within that camera:
+1台のUSBカメラは、通常いくつかの `/dev/video` デバイスを作ります。`index` はそのカメラ内での番号です。
 
-| Ends with | Usually carries |
+| 末尾 | 主な中身 |
 |---|---|
-| `video-index0` | **The normal color picture**. Use this one. |
-| `video-index1` | Metadata (no picture) |
-| `video-index2` | Infrared camera (face login), if the camera has one |
-| `video-index3` | Infrared metadata |
+| `video-index0` | **通常のカラー映像**。これを使います。 |
+| `video-index1` | メタデータ（映像なし） |
+| `video-index2` | 赤外線カメラ（顔認証用。搭載モデルのみ） |
+| `video-index3` | 赤外線のメタデータ |
 
-To check: `v4l2-ctl -d /dev/videoN --all | grep -A3 "Device Caps"`. A device that shows a picture lists **Video Capture**.
+確認方法: `v4l2-ctl -d /dev/videoN --all | grep -A3 "Device Caps"`。映像が出るデバイスには **Video Capture** と表示されます。
 
-### Quick camera test
+### カメラの簡易テスト
 
 ```bash
 python -c "import cv2; c=cv2.VideoCapture('/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0'); print('OK' if c.read()[0] else 'FAILED')"
 ```
 
-Plug the webcam into a **USB 3 port** (often blue). 4K may not work over USB 2 or through a hub.
+ウェブカメラは **USB 3 ポート**（青色のことが多い）に挿してください。USB 2 やハブ経由では4Kが使えないことがあります。
 
 ---
 
-## 3. The ArUco marker
+## 3. ArUcoマーカー
 
-- **Use exactly one marker**: dictionary **4x4_50**, **ID 0** (`marker_id0.png`).
-- **Don't use two copies of ID 0.** The tracked position jumps between them and causes false photos or countdown resets.
-- Print it about **10–15 cm** wide (15–20 cm in a real classroom). Keep the **white border** and print on matte paper, not glossy.
-- Stick it on the **sliding board panel itself**, not the wall or frame. The camera must see it at both the top and bottom positions.
-- When the marker is detected, a **green box** with `ID:0 Y:xx.x%` appears around it.
-- If the board has two panels sliding in opposite directions, put the marker on one panel. Moving only the other panel won't trigger a photo.
+- **マーカーは1枚だけ使います**: 辞書 **4x4_50**、**ID 0**（`marker_id0.png`）。
+- **ID 0 を2枚貼らないでください。** 追跡位置が2枚の間で飛び、誤撮影やカウントダウンのリセットの原因になります。
+- 幅 **10〜15 cm** 程度で印刷します（実際の教室では 15〜20 cm）。**白い余白**は残し、光沢紙ではなくつや消しの紙に印刷してください。
+- 壁や枠ではなく、**スライドする黒板の板そのもの**に貼ってください。上の位置でも下の位置でもカメラに映る必要があります。
+- マーカーを検出すると、周りに **緑の枠** と `ID:0 Y:xx.x%` が表示されます。
+- 2枚の板が逆方向にスライドする黒板では、片方の板に貼ります。もう片方だけを動かしても撮影されません。
 
-To create the marker again:
+マーカーを作り直すには:
 
 ```bash
 python -c "import cv2; m=cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50), 0, 400); m=cv2.copyMakeBorder(m,50,50,50,50,cv2.BORDER_CONSTANT,value=255); cv2.imwrite('marker_id0.png', m)"
@@ -135,195 +141,197 @@ python -c "import cv2; m=cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDi
 
 ---
 
-## 4. When a photo is taken
+## 4. 撮影されるタイミング
 
-Only the marker's **up-and-down** position counts. Position is measured as a percentage of the screen height. Sideways movement is ignored.
+マーカーの **上下方向** の位置だけを見ます。位置は画面の高さに対する割合（%）で測ります。左右の動きは無視されます。
 
-| Step | STATE shown | Condition |
+| 段階 | 表示される STATE | 条件 |
 |---|---|---|
-| 1. Waiting | `WAITING FOR ID:0...` | Marker is visible |
-| 2. Moving | `BOARD MOVING...` | Marker moves **more than 3%** between two frames in a row |
-| 3. Stopped | `STOPPED! CHECKING 2.0s` | First frame with **1.5% or less** movement, and the total move from the start is **7% or more**. Less than 7% is ignored. |
-| 4. Capture | `CAPTURING 4K PHOTO...` | Holds still (1.5% or less per frame) for **2 seconds**. Any bigger movement goes back to step 2. |
-| 5. Cooldown | `COOLDOWN 5.0s` | Waits 5 seconds, then goes back to waiting |
+| 1. 待機 | `WAITING FOR ID:0...` | マーカーが見えている |
+| 2. 移動中 | `BOARD MOVING...` | 連続する2フレーム間でマーカーが **3%より大きく** 動いた |
+| 3. 停止 | `STOPPED! CHECKING 2.0s` | 動きが **1.5%以下** になった最初のフレームで、開始位置からの総移動量が **7%以上**。7%未満なら無視されます。 |
+| 4. 撮影 | `CAPTURING 4K PHOTO...` | **2秒間** 静止している（1フレームあたり1.5%以下）。それより大きく動くと段階2に戻ります。 |
+| 5. クールダウン | `COOLDOWN 5.0s` | 5秒待ってから待機に戻る |
 
-**Notes**
-- Movement is compared **frame to frame**, so the board must move **fast**: at about 30 FPS, roughly a full screen height per second to start. A slow slide may never trigger a photo, or may be cut short and ignored. A lower FPS makes slower movement work.
-- If the marker leaves the view, everything pauses (including the countdown and cooldown) until it comes back.
-- If the board moves up and then back to the same spot, the total move is about 0, so no photo is taken.
+画面上の表示（STATE など）は OpenCV の標準フォントが日本語に対応していないため、英語のままです。
 
-### Tuning (`Config` at the top of each file)
+**注意**
+- 動きは **フレームごと** に比較するので、黒板は **速く** 動かす必要があります。約30 FPSの場合、動き始めは1秒あたり画面の高さ1つ分くらいが目安です。ゆっくりスライドすると撮影されなかったり、途中で切れて無視されたりします。FPSを下げると遅い動きでも反応します。
+- マーカーが画面から外れると、カウントダウンやクールダウンも含めてすべて一時停止し、戻ってくると再開します。
+- 黒板を上げてから同じ位置に戻した場合、総移動量はほぼ0なので撮影されません。
 
-| Setting | Default | Meaning |
+### 調整（各ファイル先頭の `Config`）
+
+| 設定 | 初期値 | 意味 |
 |---|---|---|
-| `MOVE_RATIO_THRESHOLD` | `0.03` | Jump per frame needed to start moving |
-| `MIN_TOTAL_MOVE_RATIO` | `0.07` | Minimum total move |
-| `STABLE_RATIO_THRESHOLD` | `0.015` | Most it can move per frame and still count as still |
-| `STABLE_TIME` | `2.0` | Seconds it must hold still |
-| `COOLDOWN_TIME` | `5.0` | Seconds to wait after a photo |
-| `TARGET_ARUCO_ID` | `0` | Marker ID to follow |
+| `MOVE_RATIO_THRESHOLD` | `0.03` | 移動開始と判定する1フレームあたりの移動量 |
+| `MIN_TOTAL_MOVE_RATIO` | `0.07` | 必要な最小の総移動量 |
+| `STABLE_RATIO_THRESHOLD` | `0.015` | 静止とみなす1フレームあたりの最大移動量 |
+| `STABLE_TIME` | `2.0` | 静止していなければならない秒数 |
+| `COOLDOWN_TIME` | `5.0` | 撮影後の待ち時間（秒） |
+| `TARGET_ARUCO_ID` | `0` | 追跡するマーカーのID |
 
 ---
 
-## 5. Testing the capture (`blackboard_camera.py`)
+## 5. 撮影のテスト（`blackboard_camera.py`）
 
 ```bash
 source myenv/bin/activate
 python blackboard_camera.py
 ```
 
-1. Hold the printed marker (or show it on a phone) in front of the webcam.
-2. Move it **quickly** up or down, then hold it still for 2 seconds.
-3. The terminal shows `保存成功: ~/blackboard_images/blackboard_4k_....jpg` (save successful).
-4. Press **`q`** in the camera window to quit.
+1. 印刷したマーカー（またはスマホに表示したもの）をウェブカメラの前にかざします。
+2. 上か下に **すばやく** 動かし、2秒間止めます。
+3. ターミナルに `保存成功: ~/blackboard_images/blackboard_4k_....jpg` と表示されます。
+4. カメラのウィンドウで **`q`** を押すと終了します。
 
-Check that the photo is 4K (should print `(2160, 3840, 3)`):
+写真が4Kか確認します（`(2160, 3840, 3)` と表示されればOK）。
 
 ```bash
 python -c "import cv2,glob,os; f=max(glob.glob(os.path.expanduser('~/blackboard_images/*.jpg')),key=os.path.getmtime); print(f, cv2.imread(f).shape)"
 ```
 
-| Problem | Likely cause |
+| 症状 | 考えられる原因 |
 |---|---|
-| Stays on `WAITING` while moving | Marker not detected: use more light, a bigger marker, keep the white border, check it's ID 0 from 4x4_50 |
-| Log: movement too small (`移動量が小さいため無視しました`) | Moved less than 7%. Move it farther. |
-| Countdown keeps resetting (`カウントダウンをリセットします`) | Hand shaking. Rest the paper against something. |
-| Log: 4K capture failed (`4K画像のキャプチャに失敗しました`) | Camera didn't send a 4K frame in time. See below. |
-| `select() timeout` in the terminal | Camera opened but sends no frames. See below. |
-| Camera doesn't open | Webcam not plugged in. Check `ls /dev/v4l/by-id/`. |
+| 動かしても `WAITING` のまま | マーカーが検出されていない: 明るくする、マーカーを大きくする、白い余白を残す、4x4_50 の ID 0 か確認する |
+| ログ: `移動量が小さいため無視しました` | 移動量が7%未満。もっと大きく動かす。 |
+| ログ: `カウントダウンをリセットします` が続く | 手ぶれ。紙を何かに押し当てて固定する。 |
+| ログ: `4K画像のキャプチャに失敗しました` | カメラから4Kの画像が時間内に届かなかった。下記参照。 |
+| ターミナルに `select() timeout` | カメラは開いたが画像が届かない。下記参照。 |
+| カメラが開かない | ウェブカメラが接続されていない。`ls /dev/v4l/by-id/` で確認。 |
 
-### Fixing `select() timeout` and "4K capture failed"
+### `select() timeout` と「4K画像のキャプチャに失敗しました」の対処
 
-Both errors mean the camera is open but isn't sending pictures. They often show up together. When taking a photo, the program closes the camera, reopens it at 3840x2160, and waits only **1 second** for a frame (`_execute_capture` in `blackboard_genai.py`). If no frame arrives in time, it logs `4K画像のキャプチャに失敗しました`.
+どちらも、カメラは開いているのに画像が送られてこないという意味で、よく同時に出ます。撮影時、プログラムはカメラを閉じて 3840x2160 で開き直し、画像を **1秒** しか待ちません（`blackboard_genai.py` の `_execute_capture`）。時間内に届かないと `4K画像のキャプチャに失敗しました` と表示されます。
 
-Try these in order:
+次の順番で試してください。
 
-**1. Close anything else using the camera.** That includes a browser tab, Zoom, Cheese, or an earlier run of the script (Ctrl+Z pauses a program without closing it).
+**1. カメラを使っている他のアプリを閉じる。** ブラウザのタブ、Zoom、Cheese、前回起動したスクリプトなど（Ctrl+Z はプログラムを終了せず一時停止するだけです）。
 
 ```bash
-sudo fuser -v /dev/video*       # which processes have the camera open
-pkill -f blackboard_            # kill leftover runs of the scripts
+sudo fuser -v /dev/video*       # カメラを使っているプロセスを表示
+pkill -f blackboard_            # 残っているスクリプトを終了
 ```
 
-**2. Check the USB speed.** This is the most common cause.
+**2. USBの速度を確認する。** 最も多い原因です。
 
 ```bash
 lsusb -t
 ```
 
-Find the line with `Driver=uvcvideo`. **480M** means USB 2, which can't carry 4K. Move the camera to a blue USB 3 port, not through a hub, until it shows **5000M**.
+`Driver=uvcvideo` の行を探します。**480M** は USB 2 で、4Kは流せません。**5000M** と表示されるまで、ハブを使わず青い USB 3 ポートに挿し直してください。
 
-**3. Unplug and replug the camera, or reload the driver.**
+**3. カメラを抜き差しする、またはドライバを再読み込みする。**
 
 ```bash
 sudo modprobe -r uvcvideo && sudo modprobe uvcvideo
 ```
 
-**4. Test the camera without Python.**
+**4. Pythonを使わずにカメラをテストする。**
 
 ```bash
 DEV=/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0
-v4l2-ctl -d $DEV --list-formats-ext | grep -A2 MJPG    # should list 1920x1080 and 3840x2160
+v4l2-ctl -d $DEV --list-formats-ext | grep -A2 MJPG    # 1920x1080 と 3840x2160 があるはず
 v4l2-ctl -d $DEV --set-fmt-video=width=1920,height=1080,pixelformat=MJPG --stream-mmap --stream-count=60
 v4l2-ctl -d $DEV --set-fmt-video=width=3840,height=2160,pixelformat=MJPG --stream-mmap --stream-count=30
 ```
 
-| Result | Meaning |
+| 結果 | 意味 |
 |---|---|
-| No `3840x2160` in the list | This camera can't do 4K, or `SRC` points to the wrong camera |
-| Streams (prints `<<<<` and an fps number) | Camera is fine. It's just slower than 1 second to start at 4K, so the code needs to wait longer (not done yet). |
-| Hangs or times out | USB, power or driver problem. Go to step 5. |
+| 一覧に `3840x2160` がない | このカメラは4K非対応、または `SRC` が別のカメラを指している |
+| 映像が流れる（`<<<<` とfpsの数値が表示される） | カメラは正常。4Kの起動に1秒以上かかるだけなので、コード側で待ち時間を延ばす必要がある（未対応）。 |
+| 止まる・タイムアウトする | USB、電源、ドライバの問題。手順5へ。 |
 
-**5. Turn on the driver's bandwidth fix.** This often helps on laptops and Raspberry Pis.
+**5. ドライバの帯域対策を有効にする。** ノートPCや Raspberry Pi でよく効きます。
 
 ```bash
 sudo modprobe -r uvcvideo && sudo modprobe uvcvideo quirks=128
 ```
 
-If that fixes it, make it permanent:
+これで直った場合は、永続化します。
 
 ```bash
 echo "options uvcvideo quirks=128" | sudo tee /etc/modprobe.d/uvcvideo.conf
 ```
 
-**6. Check the device name.** `SRC` in `Config` must end in **`video-index0`**. `index1` is metadata and never sends a picture.
+**6. デバイス名を確認する。** `Config` の `SRC` は **`video-index0`** で終わっている必要があります。`index1` はメタデータなので映像は出ません。
 
-**7. On a Raspberry Pi, check the power.** Use the official power supply. If `vcgencmd get_throttled` prints anything other than `0x0`, the Pi is short on power and the webcam can drop out.
+**7. Raspberry Pi では電源を確認する。** 公式の電源アダプタを使ってください。`vcgencmd get_throttled` が `0x0` 以外を表示する場合は電力不足で、ウェブカメラが切断されることがあります。
 
-**If you can't get USB 3 working,** lower the photo resolution in `Config` in both files:
+**USB 3 がどうしても使えない場合は、** 両方のファイルの `Config` で撮影解像度を下げます。
 
 ```python
-UHD_SIZE = (2560, 1440)   # only if this size appears in --list-formats-ext
-UHD_SIZE = (1920, 1080)   # same as the monitoring size, so no switching at all
+UHD_SIZE = (2560, 1440)   # --list-formats-ext にこのサイズがある場合のみ
+UHD_SIZE = (1920, 1080)   # 監視用と同じサイズ。解像度の切り替え自体がなくなる
 ```
 
-**When it happens helps narrow it down.** If the error appears only when a photo is taken (the switch to 4K), look at steps 2, 4 and 5. If it appears right at startup, look at steps 1, 3 and 6.
+**いつ起きるかで原因を絞れます。** 撮影時（4Kへの切り替え時）だけ出るなら手順2・4・5を、起動直後に出るなら手順1・3・6を確認してください。
 
 ---
 
-## 6. Using with Gemini (`blackboard_genai.py`)
+## 6. Geminiと一緒に使う（`blackboard_genai.py`）
 
 ```bash
 cd ~/chalecon
 source myenv/bin/activate
-export GEMINI_API_KEY="..."      # if it isn't in ~/.bashrc
+export GEMINI_API_KEY="..."      # ~/.bashrc に設定していない場合
 python blackboard_genai.py
 ```
 
-1. Photos are taken automatically, the same way as in `blackboard_camera.py`. The top-left shows `IMAGES: n  [Q] FINISH & SUMMARIZE`.
-2. When class ends, press **`q`** (or ESC) in the camera window.
-3. All photos are sent to Gemini (about 10–60 s), then the PDF is created.
+1. `blackboard_camera.py` と同じ方法で自動撮影されます。左上に `IMAGES: n  [Q] FINISH & SUMMARIZE` と表示されます。
+2. 授業が終わったら、カメラのウィンドウで **`q`**（またはESC）を押します。
+3. 全画像がGeminiに送られ（約10〜60秒）、PDFが作成されます。
 
-Terminal messages:
+ターミナルの表示:
 
 ```
-カメラを停止しました。撮影枚数: 3 枚        ← camera stopped, 3 photos
-3 枚の画像をGeminiに送信して要約中...      ← sending to Gemini
-AI解析完了！PDFを作成中...                 ← AI done, making PDF
-完了！要約レポートを保存しました: ...pdf    ← finished
+カメラを停止しました。撮影枚数: 3 枚
+3 枚の画像をGeminiに送信して要約中...
+AI解析完了！PDFを作成中...
+完了！要約レポートを保存しました: ...pdf
 ```
 
-### Output
+### 出力
 
 ```
 ~/blackboard_images/Class_YYYYMMDD_HHMM/
-  ├─ board_1_....jpg ...       4K photos
-  ├─ summary.txt               Gemini's raw answer
-  ├─ summary_readable.txt      formulas made readable (\frac{a}{b} → a/b)
-  └─ Summary_Report.pdf        final report
+  ├─ board_1_....jpg ...       4K画像
+  ├─ summary.txt               Geminiの生の回答
+  ├─ summary_readable.txt      数式を読みやすく変換したもの（\frac{a}{b} → a/b）
+  └─ Summary_Report.pdf        最終レポート
 ```
 
-Open the newest report:
+最新のレポートを開くには:
 
 ```bash
 xdg-open "$(ls -d ~/blackboard_images/Class_* | tail -1)/Summary_Report.pdf"
 ```
 
-### Settings
+### 設定
 
-- `SUMMARY_PROMPT`: instructions sent to Gemini. They're in English, so the summary comes back in English. Add "Answer in Japanese." for a Japanese summary.
-- `GEMINI_MODEL`: which Gemini model to use.
+- `SUMMARY_PROMPT`: Geminiに送る指示文。日本語で書かれており、「回答はすべて日本語で」と指定しているので、要約は日本語で返ってきます。まとめ方を変えたいときはこの文を編集してください。
+- `GEMINI_MODEL`: 使用するGeminiのモデル（「1. セットアップ」の「Geminiモデル」参照）。
 
-### Troubleshooting
+### トラブルシューティング
 
-| Message | Fix |
+| メッセージ | 対処 |
 |---|---|
-| API key not set (`環境変数 GEMINI_API_KEY が設定されていません`) | Set the key in the same terminal you run the program from |
-| No photos taken (`画像が撮影されなかったため…`) | Nothing to summarize, so it just exits |
-| `AI処理エラー: 404 … model not found` | Change `GEMINI_MODEL` to a current model from AI Studio |
-| `AI処理エラー: 429 …` | Free usage limit reached. Wait and retry. |
-| `AI処理エラー: 400 API key not valid` | Key copied wrong or deleted |
-| PDF error (`PDF作成エラー`) | The text is still saved in `summary.txt` |
+| `環境変数 GEMINI_API_KEY が設定されていません` | プログラムを実行するのと同じターミナルでキーを設定する |
+| `画像が撮影されなかったため…` | 要約するものがないので、そのまま終了します |
+| `AI処理エラー: 404 … model not found` | `GEMINI_MODEL` を AI Studio にある現行のモデルに変更する |
+| `AI処理エラー: 429 …` | 無料枠の上限に達した。しばらく待って再実行する。 |
+| `AI処理エラー: 400 API key not valid` | キーのコピーミス、またはキーが削除されている |
+| `PDF作成エラー` | テキストは `summary.txt` に保存されています |
 
-If the AI step fails, the photos are **not lost**. They stay in the class folder.
+AIの処理が失敗しても、画像は **消えません**。授業フォルダに残っています。
 
-The code uses Google's current `google-genai` library (`from google import genai`). Don't install the old `google-generativeai` package; it is no longer maintained.
+コードはGoogleの現行ライブラリ `google-genai`（`from google import genai`）を使っています。古い `google-generativeai` パッケージはメンテナンスが終了しているので、インストールしないでください。
 
 ---
 
-## 7. Running on a Raspberry Pi
+## 7. Raspberry Piで動かす
 
-The code works on a Raspberry Pi. It already uses the Linux camera system (V4L2), and the webcam's by-id name should be the same on the Pi (check with `ls /dev/v4l/by-id/`).
+コードは Raspberry Pi でも動きます。Linuxのカメラの仕組み（V4L2）を使っているので、ウェブカメラの by-id の名前も Pi で同じになるはずです（`ls /dev/v4l/by-id/` で確認）。
 
 ```bash
 sudo apt update
@@ -334,13 +342,13 @@ pip install opencv-contrib-python fpdf2 google-genai pillow
 export GEMINI_API_KEY="..."
 ```
 
-| Topic | What to know |
+| 項目 | 注意点 |
 |---|---|
-| Model | Pi 4 or Pi 5 with **64-bit** Raspberry Pi OS. Older models are too slow for 4K. |
-| USB | Use a **blue USB 3 port** for 4K |
-| Power | Use the official power supply. The webcam draws power from the Pi. |
-| Screen | The program shows a camera window: use the desktop OS with a monitor or VNC, not plain SSH |
-| Speed | Switching to 4K for each photo can take a few seconds |
-| Pi Camera Module | The ribbon-cable camera needs `picamera2` and won't work with this code as-is |
+| 機種 | Pi 4 または Pi 5 + **64ビット版** Raspberry Pi OS。それより古い機種は4Kには遅すぎます。 |
+| USB | 4Kには **青い USB 3 ポート** を使う |
+| 電源 | 公式の電源アダプタを使う。ウェブカメラは Pi から給電されます。 |
+| 画面 | カメラのウィンドウが表示されるので、モニターか VNC でデスクトップ版OSを使う（SSHのみでは不可） |
+| 速度 | 撮影のたびに4Kへ切り替えるので、数秒かかることがあります |
+| Piカメラモジュール | リボンケーブル式のカメラは `picamera2` が必要で、このコードのままでは動きません |
 
-Move the code with `git clone` or `scp`. Remove any API key from the code first.
+コードは `git clone` か `scp` で移します。キーはコードに含まれていないので、Pi でも `GEMINI_API_KEY` を設定してください（上の「Gemini APIキー」参照）。

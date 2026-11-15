@@ -2,7 +2,7 @@
 黒板自動撮影 ＋ Gemini要約 ＋ PDFレポート生成システム
 =====================================================
 
-blackboard_camera と genai.py を1つにまとめたプログラムです。
+blackboard_camera に Gemini による要約と PDF 出力を加えたプログラムです。
 
 【処理の流れ】
   1. USBカメラで黒板（上下スライド式）に貼ったArUcoマーカーを監視する（FHD）
@@ -56,7 +56,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 # ==========================================
 class Config:
     # --- カメラ ---
-    SRC = "/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0"  # Logicool BRIO webcam (fixed name; laptop camera = 0)
+    SRC = "/dev/v4l/by-id/usb-046d_Logicool_BRIO_F097DC64-video-index0"  # Logicool BRIO ウェブカメラ（固定のデバイス名。ノートPC内蔵カメラは 0）
     FHD_SIZE = (1920, 1080)  # 監視用の解像度
     UHD_SIZE = (3840, 2160)  # 撮影用の解像度
     FPS = 30
@@ -73,11 +73,12 @@ class Config:
     # --- 保存先 ---
     BASE_SAVE_DIR = os.path.expanduser("~/blackboard_images")
 
-    # --- Gemini ---
-    GEMINI_MODEL = "gemini-3.1-flash-lite"
+    # --- Gemini（モデルと指示文） ---
+    GEMINI_MODEL = "gemini-3.8-flash"
     SUMMARY_PROMPT = (
-        "These are whiteboard images from a class. Please summarize the content, "
-        "organize it into bullet points, and structure it well for exam review."
+        "これは授業中に撮影した黒板の画像です。内容を要約し、"
+        "箇条書きで整理して、試験の復習に使いやすいように構成してください。"
+        "回答はすべて日本語で書いてください。"
     )
 
     # --- PDF用フォント ---
@@ -875,7 +876,7 @@ def main():
     # 5. PDFレポートを作成
     pdf_path = os.path.join(session_dir, "Summary_Report.pdf")
     try:
-        create_pdf_report(readable_text, pdf_path, f"Class Summary - {session_name}")
+        create_pdf_report(readable_text, pdf_path, f"授業まとめ - {session_name}")
         logging.info(f"完了！要約レポートを保存しました: {pdf_path}")
     except Exception as e:
         logging.error(f"PDF作成エラー: {e}")
