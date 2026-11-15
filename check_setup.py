@@ -162,7 +162,22 @@ if exists:
 throttled = run(["vcgencmd", "get_throttled"]).strip()
 if throttled:
     print("\n=== Raspberry Pi の電源 ===")
-    report(throttled.endswith("=0x0"), "電源", throttled, "公式の電源アダプタを使う（電力不足だとカメラが止まる）")
+    report(throttled.endswith("=0x0"), "電源", throttled,
+           "公式の電源アダプタ（Pi 4: 5V 3A / Pi 5: 5V 5A）を使う。ウェブカメラはセルフパワーのUSB 3ハブ経由にする")
+    try:
+        bits = int(throttled.split("=")[1], 16)
+    except (IndexError, ValueError):
+        bits = 0
+    MEANINGS = [
+        (0, "今まさに電圧不足"), (1, "今まさに周波数制限中"), (2, "今まさに速度制限中"), (3, "今まさに温度制限中"),
+        (16, "起動後に電圧不足が起きた"), (17, "起動後に周波数制限が起きた"),
+        (18, "起動後に速度制限が起きた"), (19, "起動後に温度制限が起きた"),
+    ]
+    for bit, text in MEANINGS:
+        if bits & (1 << bit):
+            print(f"       ・{text}")
+    if bits & ((1 << 0) | (1 << 16)):
+        print("       電圧不足になると、USBカメラが数枚撮ったあとに切断・停止することがあります。")
 
 # ------------------------------------------------------------
 print("\n=== 結果 ===")
