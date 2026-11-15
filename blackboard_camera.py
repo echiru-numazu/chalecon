@@ -31,9 +31,14 @@ class Config:
     COOLDOWN_TIME = 5.0            # 撮影後のクールダウン時間（秒）
 
     # --- 撮影の速度・安定性 ---
-    CAPTURE_TIMEOUT = 5.0          # 4K画像が届くまで待つ最大時間（秒）
+    KEEP_HIGH_RES = False          # True: 最初から撮影用の解像度で動かし、切り替えをしない
+                                   #       （切り替えで timeout が続く場合に。CPU負荷が増えFPSは下がる）
+    CAPTURE_TIMEOUT = 5.0          # 高解像度の画像が届くまで待つ最大時間（秒）
     CAPTURE_SKIP_FRAMES = 2        # 切り替え直後に捨てるフレーム数（露出が安定するまで）
-    OPEN_RETRIES = 5               # カメラを開き直すときの最大試行回数
+    CAPTURE_ATTEMPTS = 2           # 高解像度で撮れなかったときに開き直して試す回数
+    SWITCH_DELAY = 0.5             # カメラを閉じてから開き直すまでの待ち時間（秒）
+    OPEN_RETRIES = 5               # カメラを開くときの最大試行回数
+    STALL_TIMEOUT = 3.0            # この秒数映像が届かなければカメラを自動で開き直す
     JPEG_QUALITY = 95              # 保存するJPEGの画質（0〜100）
 
 # ==========================================
@@ -64,6 +69,7 @@ class SafeDynamicCamera:
 
     撮影（解像度の切り替え → 4K画像の取得 → 監視解像度への復帰）はすべてカメラ用スレッドで行い、
     メインスレッド（画面表示・キー入力）を止めないようにしている。
+    Config.KEEP_HIGH_RES = True のときは最初から撮影用の解像度で開き、切り替えを一切しない。
     """
 
     def __init__(self, src=0, width=1920, height=1080, request_fps=30):
@@ -92,18 +98,26 @@ class SafeDynamicCamera:
     def _open(self, size):
         """指定した解像度でカメラを開く。開けないときは少し待って再試行する"""
         cap = None
-        for _ in range(Config.OPEN_RETRIES):
+        for attempt in range(1, Config.OPEN_RETRIES + 1):
             cap = cv2.VideoCapture(self.src, _camera_backend())
             if cap.isOpened():
-                break
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+                cap.set(cv2.CAP_PROP_FPS, self.request_fps)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                return cap
             cap.release()
-            time.sleep(0.2)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
-        cap.set(cv2.CAP_PROP_FPS, self.request_fps)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            logging.warning(f"カメラを開けませんでした。再試行します（{attempt}/{Config.OPEN_RETRIES}）")
+            time.sleep(0.5)
+        logging.error("カメラを開けませんでした。USBの接続と Config.SRC を確認してください。")
         return cap
+
+    def _reopen(self, cap, size):
+        """カメラを閉じ、USB・ドライバが落ち着くまで待ってから指定の解像度で開き直す"""
+        cap.release()
+        time.sleep(Config.SWITCH_DELAY)
+        return self._open(size)
 
     def _grab_photo(self, cap):
         """切り替え直後の不安定なフレームを捨ててから1枚取得する（最大 CAPTURE_TIMEOUT 秒待つ）"""
@@ -120,17 +134,32 @@ class SafeDynamicCamera:
         return frame
 
     def _do_capture(self, cap):
-        """監視用 → 撮影用 → 監視用 と切り替えて1枚撮る。新しい監視用の cap を返す"""
+        """撮影用の解像度で1枚撮り、監視用に戻す。新しい cap を返す"""
         t0 = time.time()
-        cap.release()
-        cap = self._open(self.capture_size)
-        t1 = time.time()
-        frame = self._grab_photo(cap)
-        t2 = time.time()
-        cap.release()
-        cap = self._open(self.monitor_size)
-        t3 = time.time()
-        logging.info(f"撮影時間: 切替 {t1 - t0:.1f}秒 / 取得 {t2 - t1:.1f}秒 / 復帰 {t3 - t2:.1f}秒")
+        frame = None
+
+        if Config.KEEP_HIGH_RES:
+            # すでに撮影用の解像度で動いているので、次のフレームを取るだけ
+            frame = self._grab_photo(cap)
+            logging.info(f"撮影時間: {time.time() - t0:.1f}秒（切り替えなし）")
+        else:
+            for attempt in range(1, Config.CAPTURE_ATTEMPTS + 1):
+                cap = self._reopen(cap, self.capture_size)
+                frame = self._grab_photo(cap)
+                if frame is not None:
+                    break
+                logging.warning(f"高解像度の画像が届きませんでした（{attempt}/{Config.CAPTURE_ATTEMPTS}回目）")
+            t1 = time.time()
+            cap = self._reopen(cap, self.monitor_size)
+            logging.info(f"撮影時間: 高解像度で取得 {t1 - t0:.1f}秒 / 監視に復帰 {time.time() - t1:.1f}秒")
+
+        if frame is None:
+            # 高解像度で撮れなかった場合は、撮影直前の監視用の画像で代用する（何も残らないよりよい）
+            with self.lock:
+                fallback = self.frame.copy() if self.frame is not None else None
+            if fallback is not None:
+                logging.warning("高解像度で撮影できなかったため、撮影直前の監視用画像（低解像度）を保存します。")
+                frame = fallback
 
         callback = self.capture_callback
         self.busy = False
@@ -140,25 +169,29 @@ class SafeDynamicCamera:
 
     def _thread_loop(self):
         cap = self._open(self.monitor_size)
+        last_ok = time.time()
 
         while not self.stopped:
             if self.capture_event.is_set():
                 self.capture_event.clear()
                 cap = self._do_capture(cap)
+                last_ok = time.time()
                 continue
 
-            if not cap.isOpened():
-                time.sleep(0.01)
-                continue
-
-            ret, frame = cap.read()
+            ret, frame = cap.read() if cap.isOpened() else (False, None)
             if ret and frame is not None:
+                last_ok = time.time()
                 with self.lock:
                     self.ret = ret
                     self.frame = frame
                 self.new_frame_event.set()
+            elif time.time() - last_ok > Config.STALL_TIMEOUT:
+                # 映像が止まったまま（select() timeout など）のときは自動で開き直す
+                logging.warning("カメラから映像が届かないため、カメラを開き直します。")
+                cap = self._reopen(cap, self.monitor_size)
+                last_ok = time.time()
             else:
-                time.sleep(0.005)
+                time.sleep(0.01)
 
         cap.release()
 
@@ -207,7 +240,8 @@ class BlackboardApp:
         self.save_dir = os.path.expanduser("~/blackboard_images")
         os.makedirs(self.save_dir, exist_ok=True)
         
-        self.cam = SafeDynamicCamera(Config.SRC, *Config.FHD_SIZE, Config.FPS)
+        first_size = Config.UHD_SIZE if Config.KEEP_HIGH_RES else Config.FHD_SIZE
+        self.cam = SafeDynamicCamera(Config.SRC, *first_size, Config.FPS)
         self.capture_done = threading.Event()   # カメラ用スレッドで撮影が終わったら立つ
         self.save_threads = []                  # 画像を保存中のスレッド
         self.last_display = None                # 撮影中に表示し続ける最後の画面
@@ -267,6 +301,9 @@ class BlackboardApp:
             logging.info("システムを安全に終了しました。")
 
     def _process_frame(self, frame):
+        # 高解像度のまま動かしている場合は、検出・表示用に監視サイズへ縮小する
+        if frame.shape[1] > Config.FHD_SIZE[0]:
+            frame = cv2.resize(frame, Config.FHD_SIZE, interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         if self.detector:

@@ -35,14 +35,20 @@ import re
 import cv2
 import time
 import platform
+import subprocess
 import threading
 import logging
 from datetime import datetime
 from enum import Enum, auto
 
 import PIL.Image
-from google import genai
 from fpdf import FPDF
+
+# google-genai が無くても撮影はできるように、読み込みに失敗しても止めない（要約の時点でエラーを出す）
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 # Qt系の不要なログ出力を抑制
 os.environ["QT_LOGGING_RULES"] = "*.debug=false;qt.qpa.*=false"
@@ -73,15 +79,23 @@ class Config:
     COOLDOWN_TIME = 5.0            # 撮影後のクールダウン時間（秒）
 
     # --- 撮影の速度・安定性 ---
-    CAPTURE_TIMEOUT = 5.0          # 4K画像が届くまで待つ最大時間（秒）
+    KEEP_HIGH_RES = False          # True: 最初から撮影用の解像度で動かし、切り替えをしない
+                                   #       （切り替えで timeout が続く場合に。CPU負荷が増えFPSは下がる）
+    CAPTURE_TIMEOUT = 5.0          # 高解像度の画像が届くまで待つ最大時間（秒）
     CAPTURE_SKIP_FRAMES = 2        # 切り替え直後に捨てるフレーム数（露出が安定するまで）
-    OPEN_RETRIES = 5               # カメラを開き直すときの最大試行回数
+    CAPTURE_ATTEMPTS = 2           # 高解像度で撮れなかったときに開き直して試す回数
+    SWITCH_DELAY = 0.5             # カメラを閉じてから開き直すまでの待ち時間（秒）
+    OPEN_RETRIES = 5               # カメラを開くときの最大試行回数
+    STALL_TIMEOUT = 3.0            # この秒数映像が届かなければカメラを自動で開き直す
     JPEG_QUALITY = 95              # 保存するJPEGの画質（0〜100）
 
     # --- 保存先 ---
     BASE_SAVE_DIR = os.path.expanduser("~/blackboard_images")
 
     # --- Gemini（モデルと指示文） ---
+    # APIキーは環境変数 GEMINI_API_KEY か、このファイル（キーだけを1行で書く）から読む。
+    # デスクトップのアイコンや Thonny から起動すると ~/.bashrc が読まれないため、その場合はファイルを使う。
+    API_KEY_FILE = os.path.expanduser("~/.config/gemini_api_key")
     GEMINI_MODEL = "gemini-3.8-flash"
     SUMMARY_PROMPT = (
         "これは授業中に撮影した黒板の画像です。内容を要約し、"
@@ -91,22 +105,24 @@ class Config:
 
     # --- PDF用フォント ---
     # 日本語・ギリシャ文字・数学記号を表示するため Unicode 対応フォントを使用する。
-    # 上から順に探し、最初に見つかったものをメイン、残りを不足文字の代替フォントとして使う。
-    # 環境変数 PDF_FONT_PATH で任意のフォントを最優先で指定することもできる。
-    FONT_CANDIDATES = [
+    # 日本語フォントは上から順に探し、最初に見つかったものを使う。どれも無ければ fc-list で
+    # このPCに入っている日本語フォントを自動で探す。環境変数 PDF_FONT_PATH で任意のフォントを最優先にできる。
+    # Linux / Raspberry Pi: sudo apt install fonts-noto-cjk fonts-dejavu-core
+    JAPANESE_FONTS = [
         os.environ.get("PDF_FONT_PATH", ""),
-        # Linux（Raspberry Pi など）: sudo apt install fonts-ipafont-gothic fonts-dejavu-core
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf",
         "/usr/share/fonts/opentype/ipaexfont-gothic/ipaexg.ttf",
         "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         # Windows
         "C:/Windows/Fonts/YuGothR.ttc",
         "C:/Windows/Fonts/meiryo.ttc",
         "C:/Windows/Fonts/msgothic.ttc",
         # macOS
         "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-        # 数学記号の代替用
+    ]
+    # 日本語フォントに無い文字（数学記号など）を表示するための代替フォント
+    FALLBACK_FONTS = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "C:/Windows/Fonts/seguisym.ttf",
         "C:/Windows/Fonts/cambria.ttc",
@@ -142,6 +158,7 @@ class SafeDynamicCamera:
 
     撮影（解像度の切り替え → 4K画像の取得 → 監視解像度への復帰）はすべてカメラ用スレッドで行い、
     メインスレッド（画面表示・キー入力）を止めないようにしている。
+    Config.KEEP_HIGH_RES = True のときは最初から撮影用の解像度で開き、切り替えを一切しない。
     """
 
     def __init__(self, src=0, width=1920, height=1080, request_fps=30):
@@ -170,18 +187,26 @@ class SafeDynamicCamera:
     def _open(self, size):
         """指定した解像度でカメラを開く。開けないときは少し待って再試行する"""
         cap = None
-        for _ in range(Config.OPEN_RETRIES):
+        for attempt in range(1, Config.OPEN_RETRIES + 1):
             cap = cv2.VideoCapture(self.src, _camera_backend())
             if cap.isOpened():
-                break
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+                cap.set(cv2.CAP_PROP_FPS, self.request_fps)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                return cap
             cap.release()
-            time.sleep(0.2)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
-        cap.set(cv2.CAP_PROP_FPS, self.request_fps)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            logging.warning(f"カメラを開けませんでした。再試行します（{attempt}/{Config.OPEN_RETRIES}）")
+            time.sleep(0.5)
+        logging.error("カメラを開けませんでした。USBの接続と Config.SRC を確認してください。")
         return cap
+
+    def _reopen(self, cap, size):
+        """カメラを閉じ、USB・ドライバが落ち着くまで待ってから指定の解像度で開き直す"""
+        cap.release()
+        time.sleep(Config.SWITCH_DELAY)
+        return self._open(size)
 
     def _grab_photo(self, cap):
         """切り替え直後の不安定なフレームを捨ててから1枚取得する（最大 CAPTURE_TIMEOUT 秒待つ）"""
@@ -198,17 +223,32 @@ class SafeDynamicCamera:
         return frame
 
     def _do_capture(self, cap):
-        """監視用 → 撮影用 → 監視用 と切り替えて1枚撮る。新しい監視用の cap を返す"""
+        """撮影用の解像度で1枚撮り、監視用に戻す。新しい cap を返す"""
         t0 = time.time()
-        cap.release()
-        cap = self._open(self.capture_size)
-        t1 = time.time()
-        frame = self._grab_photo(cap)
-        t2 = time.time()
-        cap.release()
-        cap = self._open(self.monitor_size)
-        t3 = time.time()
-        logging.info(f"撮影時間: 切替 {t1 - t0:.1f}秒 / 取得 {t2 - t1:.1f}秒 / 復帰 {t3 - t2:.1f}秒")
+        frame = None
+
+        if Config.KEEP_HIGH_RES:
+            # すでに撮影用の解像度で動いているので、次のフレームを取るだけ
+            frame = self._grab_photo(cap)
+            logging.info(f"撮影時間: {time.time() - t0:.1f}秒（切り替えなし）")
+        else:
+            for attempt in range(1, Config.CAPTURE_ATTEMPTS + 1):
+                cap = self._reopen(cap, self.capture_size)
+                frame = self._grab_photo(cap)
+                if frame is not None:
+                    break
+                logging.warning(f"高解像度の画像が届きませんでした（{attempt}/{Config.CAPTURE_ATTEMPTS}回目）")
+            t1 = time.time()
+            cap = self._reopen(cap, self.monitor_size)
+            logging.info(f"撮影時間: 高解像度で取得 {t1 - t0:.1f}秒 / 監視に復帰 {time.time() - t1:.1f}秒")
+
+        if frame is None:
+            # 高解像度で撮れなかった場合は、撮影直前の監視用の画像で代用する（何も残らないよりよい）
+            with self.lock:
+                fallback = self.frame.copy() if self.frame is not None else None
+            if fallback is not None:
+                logging.warning("高解像度で撮影できなかったため、撮影直前の監視用画像（低解像度）を保存します。")
+                frame = fallback
 
         callback = self.capture_callback
         self.busy = False
@@ -218,25 +258,29 @@ class SafeDynamicCamera:
 
     def _thread_loop(self):
         cap = self._open(self.monitor_size)
+        last_ok = time.time()
 
         while not self.stopped:
             if self.capture_event.is_set():
                 self.capture_event.clear()
                 cap = self._do_capture(cap)
+                last_ok = time.time()
                 continue
 
-            if not cap.isOpened():
-                time.sleep(0.01)
-                continue
-
-            ret, frame = cap.read()
+            ret, frame = cap.read() if cap.isOpened() else (False, None)
             if ret and frame is not None:
+                last_ok = time.time()
                 with self.lock:
                     self.ret = ret
                     self.frame = frame
                 self.new_frame_event.set()
+            elif time.time() - last_ok > Config.STALL_TIMEOUT:
+                # 映像が止まったまま（select() timeout など）のときは自動で開き直す
+                logging.warning("カメラから映像が届かないため、カメラを開き直します。")
+                cap = self._reopen(cap, self.monitor_size)
+                last_ok = time.time()
             else:
-                time.sleep(0.005)
+                time.sleep(0.01)
 
         cap.release()
 
@@ -294,7 +338,8 @@ class BlackboardApp:
         self.save_threads = []                  # 画像を保存中のスレッド
         self.last_display = None                # 撮影中に表示し続ける最後の画面
 
-        self.cam = SafeDynamicCamera(Config.SRC, *Config.FHD_SIZE, Config.FPS)
+        first_size = Config.UHD_SIZE if Config.KEEP_HIGH_RES else Config.FHD_SIZE
+        self.cam = SafeDynamicCamera(Config.SRC, *first_size, Config.FPS)
 
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.aruco_params = cv2.aruco.DetectorParameters()
@@ -361,6 +406,9 @@ class BlackboardApp:
         return key in (ord('q'), 27)  # 27 = ESC
 
     def _process_frame(self, frame):
+        # 高解像度のまま動かしている場合は、検出・表示用に監視サイズへ縮小する
+        if frame.shape[1] > Config.FHD_SIZE[0]:
+            frame = cv2.resize(frame, Config.FHD_SIZE, interpolation=cv2.INTER_AREA)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         if self.detector:
@@ -785,11 +833,30 @@ class LatexToReadable:
 # ==========================================
 # Gemini による要約
 # ==========================================
+def load_api_key():
+    """APIキーを 環境変数 GEMINI_API_KEY → GOOGLE_API_KEY → ファイル Config.API_KEY_FILE の順に探す"""
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if key:
+        return key.strip()
+    if os.path.exists(Config.API_KEY_FILE):
+        with open(Config.API_KEY_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+        if key:
+            return key
+    return None
+
+
 def summarize_with_gemini(image_paths):
     """撮影した画像をまとめてGeminiに送り、要約テキストを返す（失敗時は None）"""
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if genai is None:
+        logging.error("google-genai がインストールされていません。"
+                      "仮想環境を有効にして pip install google-genai を実行してください。")
+        return None
+
+    api_key = load_api_key()
     if not api_key:
-        logging.error("環境変数 GEMINI_API_KEY が設定されていません。APIキーを設定してから再実行してください。")
+        logging.error("APIキーが見つかりません。環境変数 GEMINI_API_KEY を設定するか、"
+                      f"キーだけを書いたファイル {Config.API_KEY_FILE} を作成してください。")
         return None
 
     # プロンプト（テキスト）と全画像を1つのリストにまとめて、1回の呼び出しで送る
@@ -859,18 +926,41 @@ def markdown_to_blocks(text):
     return blocks
 
 
+def _system_japanese_fonts():
+    """fc-list で、このPCに入っている日本語フォントを探す（候補リストに無い場所のフォントも使えるように）"""
+    try:
+        out = subprocess.run(["fc-list", ":lang=ja", "file"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    paths = [line.split(":")[0].strip() for line in out.splitlines() if line.strip()]
+    # fpdf2 は .ttf / .otf / .ttc を読める
+    return sorted(p for p in paths if p.lower().endswith((".ttf", ".otf", ".ttc")))
+
+
 def _setup_unicode_fonts(pdf):
     """Unicodeフォントを登録してフォント名を返す。1つも見つからなければ None"""
-    loaded = []
-    for path in Config.FONT_CANDIDATES:
-        if not path or not os.path.exists(path):
-            continue
+    existing = [p for p in Config.JAPANESE_FONTS if p and os.path.exists(p)]
+    main_candidates = existing or _system_japanese_fonts()
+    fallback_candidates = [p for p in Config.FALLBACK_FONTS if os.path.exists(p)]
+
+    def add(path):
         name = f"UniFont{len(loaded)}"
         try:
             pdf.add_font(name, "", path)
             loaded.append(name)
+            return True
         except Exception as e:
             logging.warning(f"フォントを読み込めませんでした（{path}）: {e}")
+            return False
+
+    loaded = []
+    # 日本語フォントは最初に読み込めた1つだけ使う
+    for path in main_candidates:
+        if add(path):
+            logging.info(f"PDF用フォント: {path}")
+            break
+    for path in fallback_candidates:
+        add(path)
 
     if not loaded:
         return None
@@ -879,7 +969,6 @@ def _setup_unicode_fonts(pdf):
     if len(loaded) > 1 and hasattr(pdf, "set_fallback_fonts"):
         pdf.set_fallback_fonts(loaded[1:])
     return loaded[0]
-
 
 def create_pdf_report(text, pdf_path, title):
     """読みやすく変換済みのテキストからPDFを作成する"""
